@@ -17,6 +17,7 @@ dependencies = [
     # LLM e embeddings
     "anthropic>=0.40.0",
     "openai>=1.55.0",
+    "tiktoken>=0.8.0",
     # HTTP cliente para tools externas
     "httpx>=0.28.0",
     # Workers

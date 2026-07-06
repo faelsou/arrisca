@@ -1,20 +1,19 @@
-"""Celery app + tasks de ingestão.
+"""Celery app + task de ingestão.
 
-Estado atual: stubs. A implementação real do pipeline (download,
-extração de texto, chunking com overlap, embeddings em lote via OpenAI,
-inserção transacional) entra aqui depois.
-
-Por ora a task `ingest_document` existe apenas para que
-`apps.api.routers.documents` consiga importar e enfileirar — a execução
-em si retorna NotImplementedError.
+A lógica do pipeline mora em `apps.worker.ingestion.pipeline` (funções
+puras e testáveis). Esta camada só cuida do Celery: fila, retry com
+backoff exponencial e a ponte sync→async (tasks Celery são síncronas;
+o pipeline usa asyncpg/httpx/openai assíncronos via asyncio.run).
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
-from uuid import UUID
 
 from celery import Celery
+
+from apps.worker.ingestion.pipeline import IngestionError, run_ingestion
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
@@ -32,12 +31,10 @@ celery.conf.update(
     enable_utc=True,
     task_track_started=True,
     task_acks_late=True,
+    # Ingestão é I/O-bound e pesada — um doc por worker process por vez.
+    worker_prefetch_multiplier=1,
 )
 
-
-# ---------------------------------------------------------------------------
-# Tasks
-# ---------------------------------------------------------------------------
 
 @celery.task(name="ingestion.healthcheck")
 def healthcheck() -> str:
@@ -49,33 +46,23 @@ def healthcheck() -> str:
     name="ingestion.ingest_document",
     bind=True,
     autoretry_for=(Exception,),
+    # Erros de "culpa do documento" (formato inválido, senha, vazio) não
+    # se resolvem com retry — falham direto e ficam registrados no banco.
+    dont_autoretry_for=(IngestionError,),
     retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
     retry_kwargs={"max_retries": 3},
 )
 def ingest_document(self, document_id: str) -> dict:
-    """STUB do pipeline de ingestão de um documento.
+    """Ingesta um documento: download → extração → chunking → embeddings
+    → insert transacional em document_chunks.
 
-    Pipeline real (a implementar):
-        1. Marca documento como `ingesting` no banco.
-        2. Baixa o arquivo do source_uri (S3, URL pública, etc.).
-        3. Extrai texto (PyMuPDF para PDF, python-docx para DOCX,
-           leitura direta para TXT).
-        4. Chunka com overlap (~800 tokens / 100 overlap).
-        5. Gera embeddings em lote (OpenAI text-embedding-3-small).
-        6. INSERT transacional em document_chunks com tenant_id,
-           area_id, sensitivity, is_current vindos do parent document
-           (trigger no Postgres mantém sync depois).
-        7. Marca documento como `ready`.
-
-    Por enquanto: levanta NotImplementedError. O retry exponencial vai
-    estourar `max_retries` e a task vai para o estado FAILURE — o
-    endpoint que enfileirou já retornou 202 ao usuário, então a falha
-    fica registrada no Celery e no audit log sem afetar a UI.
+    O status/erro fica sempre registrado em `documents` (o próprio
+    pipeline marca processing/completed/failed), então o frontend pode
+    fazer polling em GET /documents sem consultar o Celery.
     """
-    _ = (self, document_id)
-    raise NotImplementedError(
-        f"Pipeline de ingestão do documento {document_id} ainda não implementado."
-    )
+    return asyncio.run(run_ingestion(document_id))
 
 
 celery.autodiscover_tasks(["apps.worker.ingestion"])
